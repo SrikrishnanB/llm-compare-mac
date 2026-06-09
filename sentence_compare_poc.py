@@ -82,6 +82,8 @@ class ScoredRow(BaseModel):
     data_match_pct:     int
     template_note:      str
     data_note:          str
+    message_hyde:       str = ""
+    message_sf:         str = ""
 
 
 class OutletDiff(BaseModel):
@@ -378,7 +380,15 @@ DIMENSION 2 -- DATA MATCH (data_match_pct, integer 0-100):
             any monetary values (INR amounts).
   Do NOT factor in phrasing or template structure.
   Ignore person/DSR names -- these are expected to differ between systems.
-  100 = all data values are identical, 0 = no data values match."""
+
+  IMPORTANT -- Hyde is the production reference system. SF/Saathi is being validated against it.
+  Score based on COMPLETENESS in both directions:
+  - Data present in Hyde but missing from SF = mismatch (SF is incomplete).
+  - Data present in SF but absent from Hyde = mismatch (SF has extra/incorrect data).
+  - Score proportionally across all data points: e.g. Hyde has 5 products, SF matches 3
+    and adds 0 extra = 60%. Hyde has 5 products, SF matches 5 but adds 2 extra = ~70%.
+  100 = both messages contain exactly the same data, nothing missing, nothing extra.
+  0   = no data values match at all."""
 
 
 def _build_batch_prompt(chunk: list[dict]) -> str:
@@ -455,7 +465,8 @@ def _call_llm_batch(chunk: list[dict], model: str) -> list[LLMScore | None]:
 
 
 def score_pairs(pairs: list[dict], model: str, workers: int,
-                batch_size: int = 1) -> list[ScoredRow]:
+                batch_size: int = 1,
+                include_messages: bool = False) -> list[ScoredRow]:
     total   = len(pairs)
     results: list[ScoredRow | None] = [None] * total
     skipped = 0
@@ -486,6 +497,8 @@ def score_pairs(pairs: list[dict], model: str, workers: int,
                     data_match_pct     = score.data_match_pct,
                     template_note      = score.template_note,
                     data_note          = score.data_note,
+                    message_hyde       = pair["html_a"] if include_messages else "",
+                    message_sf         = pair["html_b"] if include_messages else "",
                 ))
         return start, scored_rows
 
@@ -615,11 +628,14 @@ def write_output_csv(
     outlet_diffs: list[OutletDiff],
     path: str,
 ) -> None:
+    has_messages = any(row.message_hyde or row.message_sf for row in scored)
     fieldnames = ["msg_type", "dsr_id", "dsr_code", "dsr_name", "date",
                   "outlet_mavic_id", "outlet_name",
                   "template_match_pct", "data_match_pct", "template_note", "data_note"]
+    if has_messages:
+        fieldnames += ["message_hyde", "message_sf"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in scored:
             writer.writerow(row.model_dump())
@@ -668,6 +684,8 @@ def main() -> None:
                         help="Process only N unique DSR IDs (each DSR = 1 pair per type per source)")
     parser.add_argument("--random",     action="store_true",        dest="use_random",
                         help="Pick DSR IDs randomly when --limit is set (default: top of file order)")
+    parser.add_argument("--include-messages", action="store_true", dest="include_messages",
+                        help="Include raw Hyde and SF messages in output CSV (for manual review)")
     parser.add_argument("--out",        default=None,               help="Base output CSV path; type suffix appended (e.g. results.csv -> results_sod.csv)")
     args = parser.parse_args()
 
@@ -747,7 +765,8 @@ def main() -> None:
               flush=True)
 
         scored = score_pairs(type_pairs, model=args.model, workers=args.workers,
-                             batch_size=args.batch_size)
+                             batch_size=args.batch_size,
+                             include_messages=args.include_messages)
 
         if not scored:
             print(f"[warn] All {type_name.upper()} pairs failed LLM comparison.", flush=True)
