@@ -24,6 +24,7 @@ import argparse
 import csv
 import html as _html_stdlib
 import json
+import random
 import sys
 import textwrap
 import threading
@@ -663,6 +664,10 @@ def main() -> None:
     parser.add_argument("--type",       default=None,               dest="msg_type",
                         choices=["sod", "eod", "previsit"],
                         help="Run only one message type (default: all three, SOD first)")
+    parser.add_argument("--limit",      default=None,               type=int,
+                        help="Process only N unique DSR IDs (each DSR = 1 pair per type per source)")
+    parser.add_argument("--random",     action="store_true",        dest="use_random",
+                        help="Pick DSR IDs randomly when --limit is set (default: top of file order)")
     parser.add_argument("--out",        default=None,               help="Base output CSV path; type suffix appended (e.g. results.csv -> results_sod.csv)")
     args = parser.parse_args()
 
@@ -678,6 +683,10 @@ def main() -> None:
         print(f"[error] --batch-size must be between 1 and 8 (got {args.batch_size})")
         sys.exit(1)
 
+    if args.limit is not None and args.limit < 1:
+        print(f"[error] --limit must be >= 1 (got {args.limit})")
+        sys.exit(1)
+
     print(f"[info] Loading files from {Path(args.docs).resolve()} ...")
     consolidated = build_consolidated_df(docs_dir=args.docs)
 
@@ -686,6 +695,17 @@ def main() -> None:
     if not pairs:
         print("[error] No comparison pairs found. Check that both Hyde/ and SF/ have matching files.")
         sys.exit(1)
+
+    # Apply --limit / --random DSR filter
+    if args.limit is not None:
+        unique_dsrs = list(dict.fromkeys(p["dsr_id"] for p in pairs))
+        if args.use_random:
+            random.shuffle(unique_dsrs)
+        selected_dsrs = set(unique_dsrs[:args.limit])
+        pairs         = [p for p in pairs         if p["dsr_id"] in selected_dsrs]
+        outlet_diffs  = [od for od in outlet_diffs if od.dsr_id in selected_dsrs]
+        print(f"[info] --limit {args.limit}{' --random' if args.use_random else ''}: "
+              f"selected {len(selected_dsrs)} DSR ID(s), {len(pairs)} pairs.")
 
     # Split by type; apply --type filter
     by_type: dict[str, list[dict]] = {"sod": [], "eod": [], "previsit": []}
