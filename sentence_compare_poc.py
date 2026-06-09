@@ -22,11 +22,13 @@ Usage
 
 import argparse
 import csv
+import html as _html_stdlib
 import json
 import sys
 import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 
 import ollama
@@ -308,6 +310,54 @@ def build_comparison_pairs(df: pd.DataFrame) -> tuple[list[dict], list[OutletDif
 # SECTION 3: LLM scoring
 # ---------------------------------------------------------------------------
 
+
+class _TextExtractor(HTMLParser):
+    """Lightweight HTML-to-plaintext converter using stdlib only."""
+
+    # Tags that should emit a newline when opened
+    _BLOCK_OPEN  = {"p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "br"}
+    # Tags that should prefix a bullet when opened
+    _BULLET_OPEN = {"li"}
+    # Tags that emit a newline when closed
+    _BLOCK_CLOSE = {"p", "div", "tr", "td", "th", "li"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        t = tag.lower()
+        if t in self._BULLET_OPEN:
+            self._parts.append("\n• ")
+        elif t in self._BLOCK_OPEN:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._BLOCK_CLOSE:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self._parts)
+        raw = _html_stdlib.unescape(raw)          # decode &amp; &#x0A; etc.
+        lines = [ln.strip() for ln in raw.splitlines()]
+        lines = [ln for ln in lines if ln]        # drop blank lines
+        return "\n".join(lines)
+
+
+def _strip_html(html_text: str) -> str:
+    """Convert HTML to readable plain text with bullet points."""
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(html_text)
+        result = extractor.get_text()
+        return result if result.strip() else html_text   # fallback to raw on empty
+    except Exception:
+        return html_text   # never crash — just use original
+
+
 _SCORING_INSTRUCTIONS = """\
 You are comparing pairs of sales briefing messages sent to the same field sales executive.
 Message A is from system Hyde. Message B is from system SF/Saathi.
@@ -335,8 +385,8 @@ def _build_batch_prompt(chunk: list[dict]) -> str:
     parts = [_SCORING_INSTRUCTIONS, f"\nYou have {n} pair(s) to score.\n"]
     for i, pair in enumerate(chunk, start=1):
         parts.append(f"\n--- PAIR {i} ---")
-        parts.append(f"\nMessage A -- Hyde (HTML):\n{pair['html_a']}")
-        parts.append(f"\nMessage B -- SF/Saathi (HTML):\n{pair['html_b']}")
+        parts.append(f"\nMessage A -- Hyde:\n{_strip_html(pair['html_a'])}")
+        parts.append(f"\nMessage B -- SF/Saathi:\n{_strip_html(pair['html_b'])}")
         parts.append(f"\n--- END PAIR {i} ---")
     parts.append(
         f'\n\nReply ONLY with valid JSON -- no extra text, no markdown fences, no explanation.\n'
