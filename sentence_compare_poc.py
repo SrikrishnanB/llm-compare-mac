@@ -36,9 +36,10 @@ from pydantic import BaseModel, Field, ValidationError
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL    = "qwen3:14b"
-DEFAULT_WORKERS  = 4
-DEFAULT_DOCS_DIR = "docs"
+DEFAULT_MODEL      = "qwen3:8b"
+DEFAULT_WORKERS    = 4
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_DOCS_DIR   = "docs"
 
 SOURCE_HYDE = "hyde"
 SOURCE_SF   = "sf"
@@ -60,6 +61,10 @@ class LLMScore(BaseModel):
     data_match_pct:     int = Field(..., ge=0, le=100)
     template_note:      str = Field(default="")
     data_note:          str = Field(default="")
+
+
+class BatchResult(BaseModel):
+    results: list[LLMScore]
 
 
 class ScoredRow(BaseModel):
@@ -303,17 +308,17 @@ def build_comparison_pairs(df: pd.DataFrame) -> tuple[list[dict], list[OutletDif
 # SECTION 3: LLM scoring
 # ---------------------------------------------------------------------------
 
-_PROMPT = """\
-You are comparing two sales briefing messages sent to the same field sales executive.
+_SCORING_INSTRUCTIONS = """\
+You are comparing pairs of sales briefing messages sent to the same field sales executive.
 Message A is from system Hyde. Message B is from system SF/Saathi.
 Both messages are in Hindi or a mix of Hindi and English.
 
-Score the similarity on TWO separate dimensions and provide a one-sentence note for each.
+For EACH pair score similarity on TWO dimensions:
 
 DIMENSION 1 -- TEMPLATE MATCH (template_match_pct, integer 0-100):
   How similar is the MESSAGE STRUCTURE and PHRASING?
   Consider: template sections, sentence patterns, language tone, number and ordering of bullet points.
-  Do NOT factor in the actual data values (numbers, product names, store names, person name).
+  Do NOT factor in actual data values (numbers, product names, store names, person names).
   100 = identical structure/phrasing, 0 = completely different structure.
 
 DIMENSION 2 -- DATA MATCH (data_match_pct, integer 0-100):
@@ -322,22 +327,33 @@ DIMENSION 2 -- DATA MATCH (data_match_pct, integer 0-100):
             any monetary values (INR amounts).
   Do NOT factor in phrasing or template structure.
   Ignore person/DSR names -- these are expected to differ between systems.
-  100 = all data values are identical, 0 = no data values match.
+  100 = all data values are identical, 0 = no data values match."""
 
---- Message A -- Hyde (HTML) ---
-{html_a}
 
---- Message B -- SF/Saathi (HTML) ---
-{html_b}
---- End ---
-
-Reply ONLY with valid JSON -- no extra text, no markdown fences, no explanation:
-{{
-  "template_match_pct": <integer 0-100>,
-  "data_match_pct": <integer 0-100>,
-  "template_note": "<one sentence in English>",
-  "data_note": "<one sentence in English>"
-}}"""
+def _build_batch_prompt(chunk: list[dict]) -> str:
+    n = len(chunk)
+    parts = [_SCORING_INSTRUCTIONS, f"\nYou have {n} pair(s) to score.\n"]
+    for i, pair in enumerate(chunk, start=1):
+        parts.append(f"\n--- PAIR {i} ---")
+        parts.append(f"\nMessage A -- Hyde (HTML):\n{pair['html_a']}")
+        parts.append(f"\nMessage B -- SF/Saathi (HTML):\n{pair['html_b']}")
+        parts.append(f"\n--- END PAIR {i} ---")
+    parts.append(
+        f'\n\nReply ONLY with valid JSON -- no extra text, no markdown fences, no explanation.\n'
+        f'Return a JSON object with a "results" array containing exactly {n} score object(s),\n'
+        f'one per pair in order:\n'
+        f'{{\n'
+        f'  "results": [\n'
+        f'    {{\n'
+        f'      "template_match_pct": <integer 0-100>,\n'
+        f'      "data_match_pct": <integer 0-100>,\n'
+        f'      "template_note": "<one sentence in English>",\n'
+        f'      "data_note": "<one sentence in English>"\n'
+        f'    }}\n'
+        f'  ]\n'
+        f'}}'
+    )
+    return "\n".join(parts)
 
 
 def check_model(model: str) -> None:
@@ -356,69 +372,93 @@ def check_model(model: str) -> None:
         sys.exit(1)
 
 
-def _call_llm(html_a: str, html_b: str, model: str) -> LLMScore | None:
-    prompt = _PROMPT.format(html_a=html_a, html_b=html_b)
+def _call_llm_batch(chunk: list[dict], model: str) -> list[LLMScore | None]:
+    """Send N pairs in one Ollama call; returns list of N scores (None on failure)."""
+    n = len(chunk)
+    prompt = _build_batch_prompt(chunk)
     try:
         response = ollama.chat(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            format=LLMScore.model_json_schema(),
+            format=BatchResult.model_json_schema(),
             think=False,
         )
-        return LLMScore.model_validate_json(response.message.content)
+        batch = BatchResult.model_validate_json(response.message.content)
+        scores: list[LLMScore | None] = list(batch.results)
+        if len(scores) != n:
+            print(f"\n[warn] LLM returned {len(scores)} scores for {n} pairs -- padding/trimming.",
+                  flush=True)
+            while len(scores) < n:
+                scores.append(None)
+            scores = scores[:n]
+        return scores
     except ValidationError as exc:
         print(f"\n[warn] Pydantic validation failed -- {exc.errors()[0]['msg']}", flush=True)
-        return None
+        return [None] * n
     except json.JSONDecodeError as exc:
         print(f"\n[warn] LLM returned non-JSON: {exc}", flush=True)
-        return None
+        return [None] * n
     except Exception as exc:
         print(f"\n[warn] Ollama error: {exc}", flush=True)
-        return None
+        return [None] * n
 
 
-def score_pairs(pairs: list[dict], model: str, workers: int) -> list[ScoredRow]:
+def score_pairs(pairs: list[dict], model: str, workers: int,
+                batch_size: int = 1) -> list[ScoredRow]:
     total   = len(pairs)
-    results = [None] * total
+    results: list[ScoredRow | None] = [None] * total
     skipped = 0
     counter = 0
     lock    = threading.Lock()
 
-    def _process(index: int, row: dict) -> tuple[int, ScoredRow | None]:
-        score = _call_llm(row["html_a"], row["html_b"], model)
-        if score is None:
-            return index, None
-        return index, ScoredRow(
-            msg_type           = row["msg_type"],
-            dsr_id             = row["dsr_id"],
-            dsr_code           = row.get("dsr_code", ""),
-            dsr_name           = row.get("dsr_name", ""),
-            date               = row["date"],
-            outlet_mavic_id    = row.get("outlet_mavic_id", ""),
-            outlet_name        = row.get("outlet_name", ""),
-            template_match_pct = score.template_match_pct,
-            data_match_pct     = score.data_match_pct,
-            template_note      = score.template_note,
-            data_note          = score.data_note,
-        )
+    chunks = [
+        (i, pairs[i : i + batch_size])
+        for i in range(0, total, batch_size)
+    ]
+
+    def _process_chunk(start: int, chunk: list[dict]) -> tuple[int, list[ScoredRow | None]]:
+        scores = _call_llm_batch(chunk, model)
+        scored_rows: list[ScoredRow | None] = []
+        for pair, score in zip(chunk, scores):
+            if score is None:
+                scored_rows.append(None)
+            else:
+                scored_rows.append(ScoredRow(
+                    msg_type           = pair["msg_type"],
+                    dsr_id             = pair["dsr_id"],
+                    dsr_code           = pair.get("dsr_code", ""),
+                    dsr_name           = pair.get("dsr_name", ""),
+                    date               = pair["date"],
+                    outlet_mavic_id    = pair.get("outlet_mavic_id", ""),
+                    outlet_name        = pair.get("outlet_name", ""),
+                    template_match_pct = score.template_match_pct,
+                    data_match_pct     = score.data_match_pct,
+                    template_note      = score.template_note,
+                    data_note          = score.data_note,
+                ))
+        return start, scored_rows
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_process, i, row): i for i, row in enumerate(pairs)}
+        futures = {pool.submit(_process_chunk, start, chunk): start
+                   for start, chunk in chunks}
         for future in as_completed(futures):
-            idx, scored_row = future.result()
-            row = pairs[idx]
+            start, scored_chunk = future.result()
             with lock:
-                counter += 1
-                label = row["outlet_name"][:15] if row.get("outlet_name") else row["msg_type"].upper()
-                print(f"\r  [{counter:>{len(str(total))}}/{total}] "
-                      f"{row['dsr_id']}  {row['date']}  {label} ...",
-                      end="", flush=True)
-            if scored_row is None:
-                print(f"\n[warn] Pair {idx+1} skipped ({row['dsr_id']} / {row['date']} / {row['msg_type']}).",
-                      flush=True)
-                skipped += 1
-            else:
-                results[idx] = scored_row
+                for j, scored_row in enumerate(scored_chunk):
+                    idx  = start + j
+                    pair = pairs[idx]
+                    counter += 1
+                    label = pair["outlet_name"][:15] if pair.get("outlet_name") else pair["msg_type"].upper()
+                    print(f"\r  [{counter:>{len(str(total))}}/{total}] "
+                          f"{pair['dsr_id']}  {pair['date']}  {label} ...",
+                          end="", flush=True)
+                    if scored_row is None:
+                        print(f"\n[warn] Pair {idx+1} skipped "
+                              f"({pair['dsr_id']} / {pair['date']} / {pair['msg_type']}).",
+                              flush=True)
+                        skipped += 1
+                    else:
+                        results[idx] = scored_row
 
     print()
     if skipped:
@@ -565,10 +605,12 @@ def main() -> None:
               python sentence_compare_poc.py --workers 6 --out results.csv
         """),
     )
-    parser.add_argument("--docs",    default=DEFAULT_DOCS_DIR, help=f"Parent folder with Hyde/ and SF/ (default: {DEFAULT_DOCS_DIR})")
-    parser.add_argument("--model",   default=DEFAULT_MODEL,    help=f"Ollama model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--workers", default=DEFAULT_WORKERS,  type=int, help=f"Parallel Ollama calls (default: {DEFAULT_WORKERS})")
-    parser.add_argument("--out",     default=None,             help="Optional output CSV path")
+    parser.add_argument("--docs",       default=DEFAULT_DOCS_DIR,  help=f"Parent folder with Hyde/ and SF/ (default: {DEFAULT_DOCS_DIR})")
+    parser.add_argument("--model",      default=DEFAULT_MODEL,     help=f"Ollama model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--workers",    default=DEFAULT_WORKERS,   type=int, help=f"Parallel Ollama calls (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--batch-size", default=DEFAULT_BATCH_SIZE, type=int, dest="batch_size",
+                        help=f"Pairs per LLM call (default: {DEFAULT_BATCH_SIZE}; reduces prompt-token overhead)")
+    parser.add_argument("--out",        default=None,              help="Optional output CSV path")
     args = parser.parse_args()
 
     if not Path(args.docs).exists():
@@ -577,6 +619,10 @@ def main() -> None:
 
     if args.workers < 1 or args.workers > 8:
         print(f"[error] --workers must be between 1 and 8 (got {args.workers})")
+        sys.exit(1)
+
+    if args.batch_size < 1 or args.batch_size > 8:
+        print(f"[error] --batch-size must be between 1 and 8 (got {args.batch_size})")
         sys.exit(1)
 
     print(f"[info] Loading files from {Path(args.docs).resolve()} ...")
@@ -595,8 +641,10 @@ def main() -> None:
 
     check_model(args.model)
 
-    print(f"[info] Sending to {args.model} via Ollama (workers={args.workers}) ...")
-    scored = score_pairs(pairs, model=args.model, workers=args.workers)
+    n_chunks = (len(pairs) + args.batch_size - 1) // args.batch_size
+    print(f"[info] Sending to {args.model} via Ollama "
+          f"(workers={args.workers}, batch_size={args.batch_size}, chunks={n_chunks}) ...")
+    scored = score_pairs(pairs, model=args.model, workers=args.workers, batch_size=args.batch_size)
 
     if not scored:
         print("[error] All pairs failed LLM comparison.")
