@@ -605,12 +605,15 @@ def main() -> None:
               python sentence_compare_poc.py --workers 6 --out results.csv
         """),
     )
-    parser.add_argument("--docs",       default=DEFAULT_DOCS_DIR,  help=f"Parent folder with Hyde/ and SF/ (default: {DEFAULT_DOCS_DIR})")
-    parser.add_argument("--model",      default=DEFAULT_MODEL,     help=f"Ollama model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--workers",    default=DEFAULT_WORKERS,   type=int, help=f"Parallel Ollama calls (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--docs",       default=DEFAULT_DOCS_DIR,   help=f"Parent folder with Hyde/ and SF/ (default: {DEFAULT_DOCS_DIR})")
+    parser.add_argument("--model",      default=DEFAULT_MODEL,      help=f"Ollama model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--workers",    default=DEFAULT_WORKERS,    type=int, help=f"Parallel Ollama calls (default: {DEFAULT_WORKERS})")
     parser.add_argument("--batch-size", default=DEFAULT_BATCH_SIZE, type=int, dest="batch_size",
                         help=f"Pairs per LLM call (default: {DEFAULT_BATCH_SIZE}; reduces prompt-token overhead)")
-    parser.add_argument("--out",        default=None,              help="Optional output CSV path")
+    parser.add_argument("--type",       default=None,               dest="msg_type",
+                        choices=["sod", "eod", "previsit"],
+                        help="Run only one message type (default: all three, SOD first)")
+    parser.add_argument("--out",        default=None,               help="Base output CSV path; type suffix appended (e.g. results.csv -> results_sod.csv)")
     args = parser.parse_args()
 
     if not Path(args.docs).exists():
@@ -634,27 +637,82 @@ def main() -> None:
         print("[error] No comparison pairs found. Check that both Hyde/ and SF/ have matching files.")
         sys.exit(1)
 
-    sod_n      = sum(1 for p in pairs if p["msg_type"] == "sod")
-    eod_n      = sum(1 for p in pairs if p["msg_type"] == "eod")
-    previsit_n = sum(1 for p in pairs if p["msg_type"] == "previsit")
-    print(f"[info] {len(pairs)} pairs ready ({sod_n} SOD, {eod_n} EOD, {previsit_n} previsit outlets).")
+    # Split by type; apply --type filter
+    by_type: dict[str, list[dict]] = {"sod": [], "eod": [], "previsit": []}
+    for p in pairs:
+        by_type[p["msg_type"]].append(p)
+
+    active_types = (
+        [(args.msg_type, by_type[args.msg_type])]
+        if args.msg_type
+        else [(t, by_type[t]) for t in ("sod", "eod", "previsit") if by_type[t]]
+    )
+
+    sod_n      = len(by_type["sod"])
+    eod_n      = len(by_type["eod"])
+    previsit_n = len(by_type["previsit"])
+    print(f"[info] {len(pairs)} pairs total ({sod_n} SOD, {eod_n} EOD, {previsit_n} previsit outlets).")
+    if args.msg_type:
+        print(f"[info] --type {args.msg_type}: processing only {len(by_type[args.msg_type])} pairs.")
 
     check_model(args.model)
 
-    n_chunks = (len(pairs) + args.batch_size - 1) // args.batch_size
-    print(f"[info] Sending to {args.model} via Ollama "
-          f"(workers={args.workers}, batch_size={args.batch_size}, chunks={n_chunks}) ...")
-    scored = score_pairs(pairs, model=args.model, workers=args.workers, batch_size=args.batch_size)
+    # Output path helper
+    def _type_out_path(type_name: str) -> str | None:
+        if not args.out:
+            return None
+        p = Path(args.out)
+        return str(p.with_name(p.stem + f"_{type_name}" + p.suffix))
 
-    if not scored:
+    all_scored: list[ScoredRow] = []
+
+    for type_name, type_pairs in active_types:
+        if not type_pairs:
+            print(f"[info] No pairs for {type_name.upper()} -- skipping.", flush=True)
+            continue
+
+        n_chunks = (len(type_pairs) + args.batch_size - 1) // args.batch_size
+        print(f"\n[info] ── {type_name.upper()} ({len(type_pairs)} pairs, "
+              f"workers={args.workers}, batch_size={args.batch_size}, chunks={n_chunks}) ──",
+              flush=True)
+
+        scored = score_pairs(type_pairs, model=args.model, workers=args.workers,
+                             batch_size=args.batch_size)
+
+        if not scored:
+            print(f"[warn] All {type_name.upper()} pairs failed LLM comparison.", flush=True)
+            continue
+
+        diffs_for_type = outlet_diffs if type_name == "previsit" else []
+        summary = build_summary(scored)
+        print_results(scored, summary, diffs_for_type, model=args.model)
+
+        out_path = _type_out_path(type_name)
+        if out_path:
+            write_output_csv(scored, diffs_for_type, out_path)
+
+        all_scored.extend(scored)
+
+    if not all_scored:
         print("[error] All pairs failed LLM comparison.")
         sys.exit(1)
 
-    summary = build_summary(scored)
-    print_results(scored, summary, outlet_diffs, model=args.model)
-
-    if args.out:
-        write_output_csv(scored, outlet_diffs, args.out)
+    # Overall summary when more than one type ran
+    if len(active_types) > 1:
+        overall_summary = build_summary(all_scored)
+        print("\n" + "=" * 60)
+        print(f"  OVERALL SUMMARY — ALL TYPES  (model: {args.model})")
+        print("=" * 60)
+        print(f"  {'TYPE':<12} {'PAIRS':>6}  {'TEMPLATE AVG':>13}  {'DATA AVG':>9}")
+        print("-" * 60)
+        for key, info in overall_summary.by_type.items():
+            print(f"  {key.upper():<12} {info.count:>6}  "
+                  f"{info.avg_template_pct:>12.1f}%  {info.avg_data_pct:>8.1f}%")
+        print("-" * 60)
+        o = overall_summary.overall
+        print(f"  {'OVERALL':<12} {o.count:>6}  "
+              f"{o.avg_template_pct:>12.1f}%  {o.avg_data_pct:>8.1f}%")
+        print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
